@@ -1722,6 +1722,15 @@ const TOOLS = [
   { name: "zeus_enrich_check", description: "Look at the open enrichment jobs; apply the answers that arrived.",
     schema: { type: "object", required: ["machine"], properties: { machine: { type: "string" } } },
     run: async ({ machine }) => zeus(`/api/${machine}/enrich/check`, { method: "POST", body: "{}" }) },
+  { name: "zeus_create_campaign", description: "Create a new campaign in the client's Lemlist and register it on the machine, ready to launch into. Returns campaign_id and sequence_id — the sequence_id is what zeus_add_steps hangs steps off. The campaign starts empty and in draft: nothing sends until steps exist and someone approves a launch. Confirm the name with the person first.",
+    schema: { type: "object", required: ["machine", "name"], properties: { machine: { type: "string" }, name: { type: "string", description: "3 to 120 characters, what it will be called in Lemlist" }, timezone: { type: "string", description: "IANA name, e.g. Europe/Madrid. Defaults to Europe/Paris" } } },
+    run: async ({ machine, ...b }) => zeus(`/api/${machine}/campaigns`, { method: "POST", body: JSON.stringify(b) }) },
+  { name: "zeus_add_steps", description: "Add steps to a campaign's sequence, in order. Types: email (needs subject and message), linkedinInvite, linkedinSend (needs message), linkedinVisit, linkedinFollow, whatsappMessage, sms, manual (needs title), phone. delay is in days before that step. Messages may use Lemlist variables like {{firstName}}, {{companyName}}, and the ones Zeus supplies: {{zeusContext}}, {{zeusPersona}}, {{msgInvite}}, {{msg1}}, {{emailSubject}}. Read the copy back to the person before adding it.",
+    schema: { type: "object", required: ["machine", "sequence_id", "steps"], properties: { machine: { type: "string" }, sequence_id: { type: "string" }, steps: { type: "array", maxItems: 20, items: { type: "object", required: ["type"], properties: { type: { type: "string", enum: ["email", "linkedinInvite", "linkedinSend", "linkedinVisit", "linkedinFollow", "whatsappMessage", "sms", "manual", "phone"] }, subject: { type: "string" }, message: { type: "string" }, altMessage: { type: "string" }, title: { type: "string" }, delay: { type: "number", description: "days before this step" }, index: { type: "number" } } } } } },
+    run: async ({ machine, sequence_id, steps }) => zeus(`/api/${machine}/sequences/${sequence_id}/steps`, { method: "POST", body: JSON.stringify({ steps }) }) },
+  { name: "zeus_sequence", description: "The steps of a campaign's sequence as Lemlist holds them: type, delay, subject and message per step. Use it to show someone what a campaign actually says before launching into it.",
+    schema: { type: "object", required: ["machine", "campaign_id"], properties: { machine: { type: "string" }, campaign_id: { type: "string" } } },
+    run: async ({ machine, campaign_id }) => zeus(`/api/${machine}/campaigns/${campaign_id}/sequences`) },
   { name: "zeus_launch_check", description: "What a launch would do, without doing it: how many are ready, how many are already queued, how many have nobody reachable, and every account whose evidence disagrees with itself (the person is in another country, or their title names another employer) with the reason. Read this out loud before launching.",
     schema: { type: "object", required: ["machine", "campaign_id"], properties: { machine: { type: "string" }, campaign_id: { type: "string" }, account_ids: { type: "array", items: { type: "string" } }, segment_id: { type: "string", description: "a table id" } } },
     run: async ({ machine, ...b }) => zeus(`/api/${machine}/outbox/launch/check`, { method: "POST", body: JSON.stringify(b) }) },
@@ -1932,6 +1941,45 @@ const TOOLS = [
         "",
         "What the copy contains:",
         ...(o.objects ?? []).map((x) => `- ${x.object}: ${Number(x.rows).toLocaleString()} records, ${x.fields} fields`),
+      ];
+      return out.join("\n");
+    } },
+  { name: "zeus_crm_clean", description: "The table we work on, built from the raw copy of the customer's CRM. Shows how many companies are complete, what each field gained over the raw copy, where each value came from, and what is still wrong. action refresh rebuilds it from the raw copy, dry shows what a rebuild would change without touching anything, and edit records a correction a person decided, which is held apart and put back on top of every later rebuild so it is never quietly undone.",
+    schema: { type: "object", required: ["machine"], properties: { machine: { type: "string" },
+      action: { type: "string", description: "board (default) | dry | refresh | edit" },
+      crm_id: { type: "string", description: "edit: the record in their CRM" },
+      field: { type: "string", description: "edit: name, domain, country, city, units, email, phone, linkedin, icp or pms" },
+      value: { type: "string", description: "edit: what it should say" },
+      why: { type: "string", description: "edit: where that came from" } } },
+    run: async ({ machine, action, crm_id, field, value, why }) => {
+      const a = action || "board";
+      if (a === "edit") {
+        if (!crm_id || !field) return "an edit needs a record and a field.";
+        const r = await zeus(`/api/${machine}/crm/edit`, { method: "POST", body: JSON.stringify({ crm_id, field, value, why }) });
+        return `${r.field} on ${r.crm_id} is now "${r.value ?? "empty"}", set by hand. It will survive every rebuild from here.`;
+      }
+      if (a === "dry" || a === "refresh") {
+        const r = await zeus(`/api/${machine}/crm/refresh`, { method: "POST", body: JSON.stringify({ dry: a === "dry" }) });
+        if (r.error) return r.error;
+        return a === "dry"
+          ? `Nothing was touched. A rebuild would add ${r.new_rows} row(s) and change ${r.fields_changed} field(s) across ${r.companies} companies.`
+          : `Rebuilt: ${r.new_rows} new row(s), ${r.fields_changed} field(s) changed, ${r.hand_edits_kept} hand edit(s) kept, ${r.companies_with_an_issue} companies still carrying an issue.`;
+      }
+      const o = await zeus(`/api/${machine}/crm`);
+      const c = o.clean;
+      if (!c) return "this machine holds no clean table yet.";
+      const out = [
+        `${c.companies} companies and ${c.people} people in the table we work on. ${c.flagged} still carry an issue, ${c.hand_edits} value(s) were set by hand.`,
+        c.last_run ? `Last rebuilt ${new Date(c.last_run.at).toISOString().slice(0, 16).replace("T", " ")} by ${c.last_run.by ?? "someone"}: ${c.last_run.new_rows} new, ${c.last_run.fields_changed} changed.` : "Never rebuilt.",
+        "",
+        "What the rebuild adds, raw to clean:",
+        ...(c.gained ?? []).map((g) => `- ${g.field}: ${g.raw} to ${g.clean}${g.clean > g.raw ? ` (+${g.clean - g.raw})` : ""}`),
+        "",
+        "What is still wrong:",
+        ...(c.issues ?? []).map((i) => `- ${i.issue}: ${i.companies}`),
+        "",
+        "Where the values come from:",
+        ...(c.sources ?? []).map((x) => `- ${x.field} from ${x.source}: ${x.companies}`),
       ];
       return out.join("\n");
     } },
